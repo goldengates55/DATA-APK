@@ -1,0 +1,494 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Write project files
+        run: |
+          set -e
+          cat > settings.gradle.kts <<'DSEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "DataSaver"
+          include(":app")
+          DSEOF
+          cat > build.gradle.kts <<'DSEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          DSEOF
+          cat > gradle.properties <<'DSEOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          DSEOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'DSEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.datasaver"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.datasaver"
+                  minSdk = 29          // NetworkStatsManager works reliably without phone-state permission from Android 10
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          // No dependencies on purpose: plain Android views, no Compose/AppCompat.
+          // This keeps the APK in the low single-digit MB, cheap to download and share.
+          DSEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'DSEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <!-- Lets the app read per-app mobile data totals. User grants it in Settings. -->
+              <uses-permission
+                  android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions" />
+
+              <!-- Needed on Android 11+ to list every app by name. Fine for direct APK;
+                   Play Store requires a policy declaration for this permission. -->
+              <uses-permission
+                  android:name="android.permission.QUERY_ALL_PACKAGES"
+                  tools:ignore="QueryAllPackagesPermission" />
+
+              <!-- Deliberately NO INTERNET permission: the app cannot send anything off the phone.
+                   Add it later only if you build update checks or sync. -->
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="Data Saver"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BlockerVpnService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          DSEOF
+          mkdir -p app/src/main/java/com/example/datasaver
+          cat > app/src/main/java/com/example/datasaver/Prefs.kt <<'DSEOF'
+          package com.example.datasaver
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("datasaver", Context.MODE_PRIVATE)
+
+              fun blocked(c: Context): Set<String> =
+                  sp(c).getStringSet("blocked", emptySet()) ?: emptySet()
+
+              fun setBlocked(c: Context, pkg: String, on: Boolean) {
+                  val s = blocked(c).toMutableSet()
+                  if (on) s.add(pkg) else s.remove(pkg)
+                  sp(c).edit().putStringSet("blocked", s).apply()
+              }
+
+              fun isBlockingOn(c: Context): Boolean = sp(c).getBoolean("blocking_on", false)
+
+              fun setBlockingOn(c: Context, on: Boolean) {
+                  sp(c).edit().putBoolean("blocking_on", on).apply()
+              }
+          }
+          DSEOF
+          mkdir -p app/src/main/java/com/example/datasaver
+          cat > app/src/main/java/com/example/datasaver/UsageRepository.kt <<'DSEOF'
+          package com.example.datasaver
+
+          import android.app.AppOpsManager
+          import android.app.usage.NetworkStats
+          import android.app.usage.NetworkStatsManager
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.os.Process
+
+          data class AppUsage(
+              val uid: Int,
+              val packageName: String?,   // null for special entries (tethering, removed apps, system uids)
+              val label: String,
+              val foregroundBytes: Long,  // used while the app was on screen
+              val backgroundBytes: Long   // used while the app was in the background
+          ) {
+              val totalBytes get() = foregroundBytes + backgroundBytes
+          }
+
+          object UsageRepository {
+
+              fun hasUsageAccess(ctx: Context): Boolean {
+                  val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                  val mode = appOps.unsafeCheckOpNoThrow(
+                      AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.packageName
+                  )
+                  return mode == AppOpsManager.MODE_ALLOWED
+              }
+
+              /** Mobile-data (SIM) usage per app between startMs and endMs, biggest first. Wi-Fi is excluded. */
+              fun queryMobileUsage(ctx: Context, startMs: Long, endMs: Long): List<AppUsage> {
+                  val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
+                  val fg = HashMap<Int, Long>()
+                  val bg = HashMap<Int, Long>()
+
+                  val stats = nsm.querySummary(ConnectivityManager.TYPE_MOBILE, null, startMs, endMs)
+                  val bucket = NetworkStats.Bucket()
+                  try {
+                      while (stats.hasNextBucket()) {
+                          stats.getNextBucket(bucket)
+                          val bytes = bucket.rxBytes + bucket.txBytes
+                          val target = if (bucket.state == NetworkStats.Bucket.STATE_FOREGROUND) fg else bg
+                          target[bucket.uid] = (target[bucket.uid] ?: 0L) + bytes
+                      }
+                  } finally {
+                      stats.close()
+                  }
+
+                  val pm = ctx.packageManager
+                  return (fg.keys + bg.keys).map { uid ->
+                      val pkg = pm.getPackagesForUid(uid)?.firstOrNull()  // shared-UID apps: first package only
+                      val label = when {
+                          uid == NetworkStats.Bucket.UID_REMOVED -> "Uninstalled apps"
+                          uid == NetworkStats.Bucket.UID_TETHERING -> "Hotspot / tethering"
+                          pkg != null -> try {
+                              pm.getApplicationInfo(pkg, 0).loadLabel(pm).toString()
+                          } catch (e: Exception) { pkg }
+                          else -> "System ($uid)"
+                      }
+                      AppUsage(uid, pkg, label, fg[uid] ?: 0L, bg[uid] ?: 0L)
+                  }.sortedByDescending { it.totalBytes }
+              }
+          }
+          DSEOF
+          mkdir -p app/src/main/java/com/example/datasaver
+          cat > app/src/main/java/com/example/datasaver/BlockerVpnService.kt <<'DSEOF'
+          package com.example.datasaver
+
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+
+          /**
+           * Per-app blocking with a local VPN.
+           *
+           * Only the apps the user chose to block are routed into the tunnel (addAllowedApplication).
+           * Every packet they send is read and discarded, so those apps get no connection.
+           * All other apps bypass the tunnel and use the network normally.
+           * Nothing leaves the phone; there is no server.
+           */
+          class BlockerVpnService : VpnService() {
+
+              private var tun: ParcelFileDescriptor? = null
+              private var drainThread: Thread? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      teardown()
+                      Prefs.setBlockingOn(this, false)
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  return if (setup()) {
+                      START_STICKY
+                  } else {
+                      Prefs.setBlockingOn(this, false)
+                      stopSelf()
+                      START_NOT_STICKY
+                  }
+              }
+
+              private fun setup(): Boolean {
+                  teardown()
+                  val blocked = Prefs.blocked(this)
+                  if (blocked.isEmpty()) return false
+
+                  val builder = Builder()
+                      .setSession("Data Saver")
+                      .setBlocking(true)
+                      .addAddress("10.255.0.2", 32)
+                      .addAddress("fd00:1:2:3::2", 128)
+                      .addRoute("0.0.0.0", 0)   // send all IPv4 from blocked apps into the tunnel
+                      .addRoute("::", 0)        // and all IPv6, otherwise it would leak past the block
+
+                  var added = 0
+                  for (pkg in blocked) {
+                      try {
+                          builder.addAllowedApplication(pkg)
+                          added++
+                      } catch (e: PackageManager.NameNotFoundException) {
+                          // app was uninstalled; skip it
+                      }
+                  }
+                  if (added == 0) return false
+
+                  val pfd = builder.establish() ?: return false  // null = VPN permission not granted
+                  tun = pfd
+
+                  // Read and throw away everything the blocked apps try to send.
+                  drainThread = Thread({
+                      val input = FileInputStream(pfd.fileDescriptor)
+                      val buf = ByteArray(32767)
+                      try {
+                          while (true) {
+                              if (input.read(buf) < 0) break
+                          }
+                      } catch (e: Exception) {
+                          // tunnel closed; thread ends
+                      }
+                  }, "datasaver-drain").also { it.start() }
+
+                  return true
+              }
+
+              private fun teardown() {
+                  try { tun?.close() } catch (e: Exception) { }  // closing unblocks the drain thread
+                  tun = null
+                  drainThread = null
+              }
+
+              override fun onRevoke() {
+                  // User turned the VPN off from system settings, or another VPN took over.
+                  teardown()
+                  Prefs.setBlockingOn(this, false)
+                  super.onRevoke()
+              }
+
+              override fun onDestroy() {
+                  teardown()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_STOP = "com.example.datasaver.STOP"
+              }
+          }
+          DSEOF
+          mkdir -p app/src/main/java/com/example/datasaver
+          cat > app/src/main/java/com/example/datasaver/MainActivity.kt <<'DSEOF'
+          package com.example.datasaver
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+          import java.util.Calendar
+
+          class MainActivity : Activity() {
+
+              private lateinit var root: LinearLayout
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val scroll = ScrollView(this)
+                  root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 40, 40, 40)
+                  }
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  render()
+              }
+
+              private fun render() {
+                  root.removeAllViews()
+                  root.addView(label("Data Saver", 24f, bold = true))
+
+                  if (!UsageRepository.hasUsageAccess(this)) {
+                      root.addView(label("Allow usage access so the app can show which apps use your mobile data. Nothing leaves your phone."))
+                      root.addView(Button(this).apply {
+                          text = "Grant usage access"
+                          setOnClickListener { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+                      })
+                      return
+                  }
+
+                  // Usage since the 1st of this month (mobile data only).
+                  val cal = Calendar.getInstance().apply {
+                      set(Calendar.DAY_OF_MONTH, 1)
+                      set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+                      set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                  }
+                  val usage = UsageRepository.queryMobileUsage(this, cal.timeInMillis, System.currentTimeMillis())
+                  val total = usage.sumOf { it.totalBytes }
+                  val background = usage.sumOf { it.backgroundBytes }
+
+                  root.addView(label("This month on mobile data: ${fmt(total)}", 18f))
+                  if (total > 0) {
+                      val pct = background * 100 / total
+                      root.addView(label("Used in the background: ${fmt(background)} ($pct%)"))
+                  }
+
+                  val blockingOn = Prefs.isBlockingOn(this)
+                  root.addView(Button(this).apply {
+                      text = if (blockingOn) "Stop blocking" else "Start blocking selected apps"
+                      setOnClickListener { if (blockingOn) stopBlocking() else requestStart() }
+                  })
+                  root.addView(label("Toggle an app to cut off its internet (Wi-Fi and mobile) while blocking is on.", 12f))
+
+                  for (app in usage.take(40)) {
+                      root.addView(row(app))
+                  }
+              }
+
+              private fun row(app: AppUsage): LinearLayout {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, 16, 0, 16)
+                  }
+                  val info = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  info.addView(label(app.label, 16f, bold = true))
+                  info.addView(label("${fmt(app.totalBytes)} total, ${fmt(app.backgroundBytes)} background", 12f))
+                  row.addView(info)
+
+                  val pkg = app.packageName
+                  if (pkg != null && pkg != packageName) {
+                      row.addView(Switch(this).apply {
+                          isChecked = Prefs.blocked(this@MainActivity).contains(pkg)
+                          setOnCheckedChangeListener { _, on ->
+                              Prefs.setBlocked(this@MainActivity, pkg, on)
+                              if (Prefs.isBlockingOn(this@MainActivity)) startBlocking() // apply the change now
+                          }
+                      })
+                  }
+                  return row
+              }
+
+              // --- Blocking control -------------------------------------------------
+
+              private fun requestStart() {
+                  val intent = VpnService.prepare(this)   // null if permission was already granted
+                  if (intent != null) startActivityForResult(intent, REQ_VPN) else startBlocking()
+              }
+
+              @Deprecated("Fine for a skeleton; move to the Activity Result API later")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_VPN && resultCode == RESULT_OK) startBlocking()
+              }
+
+              private fun startBlocking() {
+                  Prefs.setBlockingOn(this, true)
+                  startService(Intent(this, BlockerVpnService::class.java))
+                  root.postDelayed({ render() }, 300)
+              }
+
+              private fun stopBlocking() {
+                  startService(Intent(this, BlockerVpnService::class.java).setAction(BlockerVpnService.ACTION_STOP))
+                  Prefs.setBlockingOn(this, false)
+                  root.postDelayed({ render() }, 300)
+              }
+
+              // --- Small helpers ----------------------------------------------------
+
+              private fun label(text: String, size: Float = 14f, bold: Boolean = false) = TextView(this).apply {
+                  this.text = text
+                  textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+                  setPadding(0, 8, 0, 8)
+              }
+
+              private fun fmt(bytes: Long): String = when {
+                  bytes >= 1L shl 30 -> "%.2f GB".format(bytes / 1073741824.0)
+                  bytes >= 1L shl 20 -> "%.1f MB".format(bytes / 1048576.0)
+                  else -> "${bytes / 1024} KB"
+              }
+
+              companion object {
+                  private const val REQ_VPN = 1
+              }
+          }
+          DSEOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK as a release (direct download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Data Saver build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
